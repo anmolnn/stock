@@ -84,8 +84,20 @@ def get_updates(offset=None):
 def get_price(ticker):
     try:
         stock = yf.Ticker(ticker)
-        price = stock.fast_info["last_price"]
-        return round(price, 2)
+
+        # Try fast_info first
+        price = stock.fast_info.get("last_price")
+
+        # Fallback to history if fast_info fails
+        if price is None:
+            hist = stock.history(period="1d")
+            if not hist.empty:
+                price = hist["Close"].iloc[-1]
+            else:
+                return None
+
+        return round(float(price), 2)
+
     except Exception as e:
         print(f"[Price Error] {ticker}: {e}")
         return None
