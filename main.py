@@ -1,6 +1,10 @@
 """
 NSE/BSE Stock Alert Telegram Bot
-Full Render Production Version
+- Runs between 9:15 AM - 5:00 PM IST
+- Sends hourly updates: current price + gain/loss in Rs
+- Sends an immediate price update when a stock is added
+- Lets you add your Groww holdings via Telegram commands
+- Sends alert if stock falls below your set threshold
 """
 
 import yfinance as yf
@@ -10,9 +14,10 @@ import json
 import os
 import schedule
 from datetime import datetime
+from dotenv import load_dotenv
 import pytz
-from flask import Flask
-from threading import Thread
+
+load_dotenv()  # loads from .env file when running locally
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
@@ -20,25 +25,11 @@ from threading import Thread
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
+# File to persist your holdings and watchlist between restarts
 DATA_FILE = "stock_data.json"
+
+# IST Timezone
 IST = pytz.timezone("Asia/Kolkata")
-
-# ─────────────────────────────────────────────
-# KEEP ALIVE SERVER (RENDER)
-# ─────────────────────────────────────────────
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Stock Bot is running!"
-
-def run_web():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
-
-def keep_alive():
-    t = Thread(target=run_web)
-    t.start()
 
 # ─────────────────────────────────────────────
 # DATA PERSISTENCE
@@ -47,7 +38,10 @@ def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
             return json.load(f)
-    return {"holdings": {}, "watchlist": []}
+    return {
+        "holdings": {},  # { "RELIANCE.NS": {"qty": 10, "buy_price": 2500, "alert_below": 2400} }
+        "watchlist": []  # tickers to monitor even without holdings
+    }
 
 def save_data(data):
     with open(DATA_FILE, "w") as f:
@@ -57,77 +51,71 @@ def save_data(data):
 # TELEGRAM FUNCTIONS
 # ─────────────────────────────────────────────
 def send_message(text):
+    """Send a message to your Telegram chat."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, data={
-            "chat_id": CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML"
-        }, timeout=10)
+        requests.post(
+            url,
+            data={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=10
+        )
     except Exception as e:
         print(f"[Telegram Error] {e}")
 
 def get_updates(offset=None):
+    """Poll Telegram for new messages (commands from you)."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-    params = {"timeout": 10}
+    params = {"timeout": 5}
     if offset:
         params["offset"] = offset
     try:
-        resp = requests.get(url, params=params, timeout=15)
+        resp = requests.get(url, params=params, timeout=10)
         return resp.json().get("result", [])
-    except:
+    except Exception as e:
+        print(f"[getUpdates Error] {e}")
         return []
 
 # ─────────────────────────────────────────────
 # STOCK PRICE FUNCTIONS
 # ─────────────────────────────────────────────
 def get_price(ticker):
+    """Fetch current price for a given ticker (e.g. RELIANCE.NS)."""
     try:
         stock = yf.Ticker(ticker)
-
-        # Try fast_info first
-        price = stock.fast_info.get("last_price")
-
-        # Fallback to history if fast_info fails
-        if price is None:
-            hist = stock.history(period="1d")
-            if not hist.empty:
-                price = hist["Close"].iloc[-1]
-            else:
-                return None
-
-        return round(float(price), 2)
-
+        price = stock.fast_info["last_price"]
+        return round(price, 2)
     except Exception as e:
         print(f"[Price Error] {ticker}: {e}")
         return None
 
 def is_market_open():
+    """Check if tracking is active (9:15 AM - 5:00 PM IST, Mon-Fri)."""
     now = datetime.now(IST)
-    if now.weekday() >= 5:
+    if now.weekday() >= 5:  # Saturday=5, Sunday=6
         return False
     market_open  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
     market_close = now.replace(hour=17, minute=0,  second=0, microsecond=0)
     return market_open <= now <= market_close
 
 # ─────────────────────────────────────────────
-# HOURLY UPDATE
+# HOURLY UPDATE MESSAGE
 # ─────────────────────────────────────────────
 def send_hourly_update(force=False):
+    """Send price + P&L update for all holdings and watchlist stocks."""
     if not force and not is_market_open():
         return
 
     data = load_data()
     if not data["holdings"] and not data["watchlist"]:
-        send_message("No stocks added yet.\nUse /add to begin.")
+        send_message("No stocks in your watchlist or holdings yet.\nUse /add to add a stock.")
         return
 
     now_str = datetime.now(IST).strftime("%I:%M %p")
-    msg = f"<b>Portfolio Update - {now_str} IST</b>\n{'─'*28}\n"
+    msg = f"<b>Hourly Update - {now_str} IST</b>\n{'─'*28}\n"
 
     all_tickers = set(data["holdings"].keys()) | set(data["watchlist"])
 
-    for ticker in all_tickers:
+    for ticker in sorted(all_tickers):
         price = get_price(ticker)
         display = ticker.replace(".NS", "").replace(".BO", "")
 
@@ -136,34 +124,41 @@ def send_hourly_update(force=False):
             continue
 
         msg += f"\n<b>{display}</b>\n"
-        msg += f"Price: Rs {price:,.2f}\n"
+        msg += f"   Price: Rs {price:,.2f}\n"
 
+        # P&L if holding exists
         if ticker in data["holdings"]:
             h = data["holdings"][ticker]
             qty = h["qty"]
             buy_price = h["buy_price"]
             pnl = (price - buy_price) * qty
             pnl_label = "GAIN" if pnl >= 0 else "LOSS"
-            msg += f"P&L ({pnl_label}): Rs {pnl:+,.2f} ({qty} shares @ Rs {buy_price})\n"
+            msg += f"   P&L ({pnl_label}): Rs {pnl:+,.2f} ({qty} shares @ Rs {buy_price})\n"
 
+            # Alert if below threshold
             if "alert_below" in h and price < h["alert_below"]:
                 send_message(
-                    f"🚨 ALERT: <b>{display}</b>\n"
-                    f"Price Rs {price:,.2f} below alert level Rs {h['alert_below']:,.2f}"
+                    f"ALERT: <b>{display}</b>\n"
+                    f"Price Rs {price:,.2f} has dropped below your alert level of Rs {h['alert_below']:,.2f}!\n"
+                    f"P&L: Rs {pnl:+,.2f}"
                 )
 
     send_message(msg)
 
 def send_single_stock_update(ticker):
+    """Send an immediate price update for one stock right after it is added."""
     price = get_price(ticker)
     display = ticker.replace(".NS", "").replace(".BO", "")
     now_str = datetime.now(IST).strftime("%I:%M %p")
 
     if price is None:
-        send_message(f"Could not fetch current price for <b>{display}</b>.")
+        send_message(
+            f"Could not fetch current price for <b>{display}</b>.\n"
+            f"Check that the ticker is correct (e.g. RELIANCE.NS, TATSILV.NS)"
+        )
         return
 
-    msg = f"<b>{display}</b> - Current Price ({now_str} IST)\n"
+    msg = f"<b>{display}</b> - Current Price as of {now_str} IST\n"
     msg += f"Price: Rs {price:,.2f}\n"
 
     data = load_data()
@@ -173,7 +168,7 @@ def send_single_stock_update(ticker):
         buy_price = h["buy_price"]
         pnl = (price - buy_price) * qty
         pnl_label = "GAIN" if pnl >= 0 else "LOSS"
-        msg += f"P&L ({pnl_label}): Rs {pnl:+,.2f}\n"
+        msg += f"P&L ({pnl_label}): Rs {pnl:+,.2f} ({qty} shares @ Rs {buy_price})\n"
 
     send_message(msg)
 
@@ -181,41 +176,60 @@ def send_single_stock_update(ticker):
 # COMMAND HANDLER
 # ─────────────────────────────────────────────
 def handle_commands():
+    """
+    Supported commands:
+    /add RELIANCE.NS 10 2500 2400   -> Add holding (alert_below is optional)
+    /remove RELIANCE.NS             -> Remove a holding or watchlist stock
+    /watch TCS.NS                   -> Watch price without holding info
+    /portfolio                      -> Show current snapshot instantly
+    /help                           -> Show all commands
+    """
     updates = get_updates(offset=handle_commands.last_update_id)
 
     for update in updates:
         handle_commands.last_update_id = update["update_id"] + 1
+
         msg = update.get("message", {})
         text = msg.get("text", "").strip()
         chat_id = str(msg.get("chat", {}).get("id", ""))
 
+        # Only respond to your own chat
         if chat_id != str(CHAT_ID):
             continue
 
-        parts = text.split()
-        cmd = parts[0].lower() if parts else ""
+        if not text:
+            continue
 
-        # HELP
+        parts = text.split()
+        cmd = parts[0].lower()
+
+        # /help
         if cmd == "/help":
             send_message(
                 "<b>Stock Bot Commands</b>\n\n"
-                "/add TICKER QTY BUY_PRICE [ALERT_BELOW]\n"
-                "/remove TICKER\n"
-                "/watch TICKER\n"
-                "/portfolio\n"
-                "/help"
+                "/add <b>TICKER QTY BUY_PRICE [ALERT_BELOW]</b>\n"
+                "  e.g. <code>/add RELIANCE.NS 10 2500 2400</code>\n\n"
+                "/remove <b>TICKER</b>\n"
+                "  e.g. <code>/remove RELIANCE.NS</code>\n\n"
+                "/watch <b>TICKER</b>\n"
+                "  e.g. <code>/watch TCS.NS</code> (track price, no holdings)\n\n"
+                "/portfolio - View current snapshot\n"
+                "/help - Show this message\n\n"
+                "Tip: Use <code>.NS</code> for NSE, <code>.BO</code> for BSE"
             )
 
-        # ADD
+        # /add TICKER QTY BUY_PRICE [ALERT_BELOW]
         elif cmd == "/add":
             if len(parts) < 4:
-                send_message("Usage: /add TICKER QTY BUY_PRICE [ALERT_BELOW]")
+                send_message(
+                    "Usage: /add TICKER QTY BUY_PRICE [ALERT_BELOW]\n"
+                    "Example: /add RELIANCE.NS 10 2500 2400"
+                )
                 continue
-
             try:
-                ticker = parts[1].upper()
-                qty = float(parts[2])
-                buy_price = float(parts[3])
+                ticker      = parts[1].upper()
+                qty         = float(parts[2])
+                buy_price   = float(parts[3])
                 alert_below = float(parts[4]) if len(parts) > 4 else None
 
                 data = load_data()
@@ -224,21 +238,28 @@ def handle_commands():
                     entry["alert_below"] = alert_below
 
                 data["holdings"][ticker] = entry
+
+                # Remove from watchlist if it was there
                 if ticker in data["watchlist"]:
                     data["watchlist"].remove(ticker)
 
                 save_data(data)
 
-                send_message(f"Added <b>{ticker}</b>")
+                display = ticker.replace(".NS", "").replace(".BO", "")
+                alert_txt = f"\nAlert set below Rs {alert_below:,.2f}" if alert_below else ""
+                send_message(f"Added <b>{display}</b>\n{qty} shares @ Rs {buy_price:,.2f}{alert_txt}")
+
+                # Send immediate price update
                 send_single_stock_update(ticker)
 
-            except:
+            except Exception as e:
+                print(f"[/add Error] {e}")
                 send_message("Invalid format. Example: /add RELIANCE.NS 10 2500 2400")
 
-        # REMOVE
+        # /remove TICKER
         elif cmd == "/remove":
             if len(parts) < 2:
-                send_message("Usage: /remove TICKER")
+                send_message("Usage: /remove TICKER\nExample: /remove RELIANCE.NS")
                 continue
 
             ticker = parts[1].upper()
@@ -248,18 +269,26 @@ def handle_commands():
             if ticker in data["holdings"]:
                 del data["holdings"][ticker]
                 removed = True
-
             if ticker in data["watchlist"]:
                 data["watchlist"].remove(ticker)
                 removed = True
 
             save_data(data)
-            send_message(f"Removed {ticker}" if removed else "Ticker not found.")
+            display = ticker.replace(".NS", "").replace(".BO", "")
 
-        # WATCH
+            if removed:
+                send_message(f"Removed <b>{display}</b> successfully.")
+            else:
+                send_message(
+                    f"<b>{display}</b> not found in your list.\n"
+                    f"Make sure you include .NS or .BO\n"
+                    f"Example: /remove RELIANCE.NS"
+                )
+
+        # /watch TICKER
         elif cmd == "/watch":
             if len(parts) < 2:
-                send_message("Usage: /watch TICKER")
+                send_message("Usage: /watch TICKER\nExample: /watch TCS.NS")
                 continue
 
             ticker = parts[1].upper()
@@ -269,36 +298,64 @@ def handle_commands():
                 data["watchlist"].append(ticker)
                 save_data(data)
 
-            send_message(f"Now watching {ticker}")
+            display = ticker.replace(".NS", "").replace(".BO", "")
+            send_message(f"Now watching <b>{display}</b> (no holding info)")
+
+            # Send immediate price update
             send_single_stock_update(ticker)
 
-        # PORTFOLIO
+        # /portfolio
         elif cmd == "/portfolio":
             send_hourly_update(force=True)
 
+        else:
+            send_message("Unknown command. Type /help to see available commands.")
+
+# Persist last update ID across calls
 handle_commands.last_update_id = 0
 
 # ─────────────────────────────────────────────
 # SCHEDULER
 # ─────────────────────────────────────────────
 def setup_schedule():
-    for hour in range(9, 18):
+    # Send update every hour on the hour (10 AM to 4 PM)
+    for hour in range(10, 17):
         t = f"{hour:02d}:00"
         schedule.every().day.at(t).do(send_hourly_update)
+
+    # Market open notification at 9:15 AM
+    schedule.every().day.at("09:15").do(
+        lambda: send_message("<b>Tracking Started!</b> Updates every hour until 5:00 PM IST.")
+    )
+
+    # Final 5 PM update — forced so it always fires at market close boundary
+    schedule.every().day.at("17:00").do(
+        lambda: (send_hourly_update(force=True),
+                 send_message("<b>Tracking Stopped.</b> Will resume tomorrow at 9:15 AM IST."))
+    )
 
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 def main():
-    print("Stock Bot started...")
-    send_message("<b>Stock Alert Bot is Online!</b>\nType /help")
+    if not BOT_TOKEN or not CHAT_ID:
+        print("[ERROR] BOT_TOKEN or CHAT_ID is missing. Check your .env file.")
+        return
+
+    print("Stock Bot started. Waiting for commands and market hours...")
+    send_message(
+        "<b>Stock Alert Bot is Online!</b>\n\n"
+        "Updates run: Mon-Fri, 9:15 AM - 5:00 PM IST\n"
+        "Hourly price + P&L reports\n\n"
+        "Type /help to get started."
+    )
+
     setup_schedule()
 
     while True:
         schedule.run_pending()
         handle_commands()
-        time.sleep(3)
+        time.sleep(3)  # Poll for commands every 3 seconds
 
 if __name__ == "__main__":
-    keep_alive()
     main()
