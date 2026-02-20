@@ -16,17 +16,12 @@ import schedule
 from datetime import datetime
 import pytz
 
-
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-
-# File to persist your holdings and watchlist between restarts
 DATA_FILE = "stock_data.json"
-
-# IST Timezone
 IST = pytz.timezone("Asia/Kolkata")
 
 # ─────────────────────────────────────────────
@@ -36,10 +31,7 @@ def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
             return json.load(f)
-    return {
-        "holdings": {},  # { "RELIANCE.NS": {"qty": 10, "buy_price": 2500, "alert_below": 2400} }
-        "watchlist": []  # tickers to monitor even without holdings
-    }
+    return {"holdings": {}, "watchlist": []}
 
 def save_data(data):
     with open(DATA_FILE, "w") as f:
@@ -49,7 +41,6 @@ def save_data(data):
 # TELEGRAM FUNCTIONS
 # ─────────────────────────────────────────────
 def send_message(text):
-    """Send a message to your Telegram chat."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
         requests.post(
@@ -60,8 +51,7 @@ def send_message(text):
     except Exception as e:
         print(f"[Telegram Error] {e}")
 
-def get_updates(offset=None):
-    """Poll Telegram for new messages (commands from you)."""
+def get_updates(offset):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
     params = {"timeout": 5}
     if offset:
@@ -73,33 +63,57 @@ def get_updates(offset=None):
         print(f"[getUpdates Error] {e}")
         return []
 
+def skip_old_updates():
+    """On startup, fast-forward past all pending messages so they are not reprocessed."""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    try:
+        resp = requests.get(url, params={"timeout": 0}, timeout=10)
+        results = resp.json().get("result", [])
+        if results:
+            last_id = results[-1]["update_id"] + 1
+            print(f"Skipping old updates, starting from ID: {last_id}")
+            return last_id
+    except Exception as e:
+        print(f"[skip_old_updates Error] {e}")
+    return 0
+
 # ─────────────────────────────────────────────
 # STOCK PRICE FUNCTIONS
 # ─────────────────────────────────────────────
 def get_price(ticker):
-    """Fetch current price for a given ticker (e.g. RELIANCE.NS)."""
+    """Fetch current price. Tries fast_info first, falls back to history for ETFs."""
     try:
         stock = yf.Ticker(ticker)
-        price = stock.fast_info["last_price"]
-        return round(price, 2)
+        try:
+            price = stock.fast_info["last_price"]
+            if price and price > 0:
+                return round(price, 2)
+        except:
+            pass
+        # Fallback for ETFs like TATSILV.NS
+        hist = stock.history(period="2d")
+        if not hist.empty:
+            return round(float(hist["Close"].iloc[-1]), 2)
     except Exception as e:
         print(f"[Price Error] {ticker}: {e}")
-        return None
+    return None
 
 def is_market_open():
-    """Check if tracking is active (9:15 AM - 5:00 PM IST, Mon-Fri)."""
     now = datetime.now(IST)
-    if now.weekday() >= 5:  # Saturday=5, Sunday=6
+    if now.weekday() >= 5:
         return False
     market_open  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
     market_close = now.replace(hour=17, minute=0,  second=0, microsecond=0)
     return market_open <= now <= market_close
 
+def format_qty(qty):
+    """Show 10 instead of 10.0 for whole numbers."""
+    return int(qty) if qty == int(qty) else qty
+
 # ─────────────────────────────────────────────
-# HOURLY UPDATE MESSAGE
+# UPDATE MESSAGES
 # ─────────────────────────────────────────────
-def send_hourly_update(force=False, title="Hourly Update"):
-    """Send price + P&L update for all holdings and watchlist stocks."""
+def send_portfolio(force=False, title="Hourly Update"):
     if not force and not is_market_open():
         return
 
@@ -124,76 +138,58 @@ def send_hourly_update(force=False, title="Hourly Update"):
         msg += f"\n<b>{display}</b>\n"
         msg += f"   Price: Rs {price:,.2f}\n"
 
-        # P&L if holding exists
         if ticker in data["holdings"]:
             h = data["holdings"][ticker]
             qty = h["qty"]
             buy_price = h["buy_price"]
             pnl = (price - buy_price) * qty
             pnl_label = "GAIN" if pnl >= 0 else "LOSS"
-            msg += f"   P&L ({pnl_label}): Rs {pnl:+,.2f} ({qty} shares @ Rs {buy_price})\n"
+            msg += f"   P&L ({pnl_label}): Rs {pnl:+,.2f} ({format_qty(qty)} shares @ Rs {buy_price})\n"
 
-            # Alert if below threshold
             if "alert_below" in h and price < h["alert_below"]:
                 send_message(
                     f"ALERT: <b>{display}</b>\n"
-                    f"Price Rs {price:,.2f} has dropped below your alert level of Rs {h['alert_below']:,.2f}!\n"
+                    f"Price Rs {price:,.2f} dropped below Rs {h['alert_below']:,.2f}!\n"
                     f"P&L: Rs {pnl:+,.2f}"
                 )
 
     send_message(msg)
 
-def send_single_stock_update(ticker, confirmed=False, alert_below=None):
-    """Send an immediate price update for one stock. If confirmed=True, include the add confirmation in the same message."""
+def send_market_close():
+    """Called at 5 PM - sends final portfolio then goodbye message."""
+    send_portfolio(force=True, title="End of Day Update")
+    send_message("<b>Tracking Stopped.</b> Resumes tomorrow at 9:15 AM IST.")
+
+def send_stock_added_message(ticker, qty, buy_price, alert_below):
+    """Single combined message shown right after /add."""
     price = get_price(ticker)
     display = ticker.replace(".NS", "").replace(".BO", "")
     now_str = datetime.now(IST).strftime("%I:%M %p")
 
+    alert_txt = f"\nAlert set below Rs {alert_below:,.2f}" if alert_below else ""
+    msg = f"Added <b>{display}</b>\n{format_qty(qty)} shares @ Rs {buy_price:,.2f}{alert_txt}\n\n"
+
     if price is None:
-        send_message(
-            f"Could not fetch current price for <b>{display}</b>.\n"
-            f"Check that the ticker is correct (e.g. RELIANCE.NS, TATSILV.NS)"
-        )
-        return
-
-    data = load_data()
-    msg = ""
-
-    # If called right after /add, include the confirmation at the top
-    if confirmed and ticker in data["holdings"]:
-        h = data["holdings"][ticker]
-        alert_txt = f"\nAlert set below Rs {alert_below:,.2f}" if alert_below else ""
-        msg += f"Added <b>{display}</b>\n{h['qty']} shares @ Rs {h['buy_price']:,.2f}{alert_txt}\n\n"
-
-    msg += f"<b>{display}</b> - Current Price as of {now_str} IST\n"
-    msg += f"Price: Rs {price:,.2f}\n"
-
-    if ticker in data["holdings"]:
-        h = data["holdings"][ticker]
-        qty = h["qty"]
-        buy_price = h["buy_price"]
+        msg += "Could not fetch current price.\nCheck that ticker is correct (e.g. TATSILV.NS)"
+    else:
         pnl = (price - buy_price) * qty
         pnl_label = "GAIN" if pnl >= 0 else "LOSS"
-        msg += f"P&L ({pnl_label}): Rs {pnl:+,.2f} ({qty} shares @ Rs {buy_price})\n"
+        msg += f"Current Price as of {now_str} IST: Rs {price:,.2f}\n"
+        msg += f"P&L ({pnl_label}): Rs {pnl:+,.2f}"
 
     send_message(msg)
 
 # ─────────────────────────────────────────────
 # COMMAND HANDLER
 # ─────────────────────────────────────────────
+last_update_id = 0
+
 def handle_commands():
-    """
-    Supported commands:
-    /add RELIANCE.NS 10 2500 2400   -> Add holding (alert_below is optional)
-    /remove RELIANCE.NS             -> Remove a holding or watchlist stock
-    /watch TCS.NS                   -> Watch price without holding info
-    /portfolio                      -> Show current snapshot instantly
-    /help                           -> Show all commands
-    """
-    updates = get_updates(offset=handle_commands.last_update_id)
+    global last_update_id
+    updates = get_updates(offset=last_update_id)
 
     for update in updates:
-        handle_commands.last_update_id = update["update_id"] + 1
+        last_update_id = update["update_id"] + 1
 
         msg = update.get("message", {})
         text = msg.get("text", "").strip()
@@ -203,33 +199,39 @@ def handle_commands():
         if chat_id != str(CHAT_ID):
             continue
 
+        # Skip empty messages
         if not text:
             continue
 
         parts = text.split()
+
+        # Skip if no command
+        if not parts or not parts[0].startswith("/"):
+            continue
+
         cmd = parts[0].lower()
 
-        # /help
+        # ── /help ──────────────────────────────
         if cmd == "/help":
             send_message(
                 "<b>Stock Bot Commands</b>\n\n"
                 "/add <b>TICKER QTY BUY_PRICE [ALERT_BELOW]</b>\n"
-                "  e.g. <code>/add RELIANCE.NS 10 2500 2400</code>\n\n"
+                "  e.g. <code>/add TATSILV.NS 10 23.47 20</code>\n\n"
                 "/remove <b>TICKER</b>\n"
-                "  e.g. <code>/remove RELIANCE.NS</code>\n\n"
+                "  e.g. <code>/remove TATSILV.NS</code>\n\n"
                 "/watch <b>TICKER</b>\n"
-                "  e.g. <code>/watch TCS.NS</code> (track price, no holdings)\n\n"
+                "  e.g. <code>/watch TCS.NS</code>\n\n"
                 "/portfolio - View current snapshot\n"
                 "/help - Show this message\n\n"
-                "Tip: Use <code>.NS</code> for NSE, <code>.BO</code> for BSE"
+                "Tip: Always include <code>.NS</code> for NSE or <code>.BO</code> for BSE"
             )
 
-        # /add TICKER QTY BUY_PRICE [ALERT_BELOW]
+        # ── /add ───────────────────────────────
         elif cmd == "/add":
             if len(parts) < 4:
                 send_message(
                     "Usage: /add TICKER QTY BUY_PRICE [ALERT_BELOW]\n"
-                    "Example: /add RELIANCE.NS 10 2500 2400"
+                    "Example: /add TATSILV.NS 10 23.47 20"
                 )
                 continue
             try:
@@ -242,128 +244,106 @@ def handle_commands():
                 entry = {"qty": qty, "buy_price": buy_price}
                 if alert_below:
                     entry["alert_below"] = alert_below
-
                 data["holdings"][ticker] = entry
-
-                # Remove from watchlist if it was there
                 if ticker in data["watchlist"]:
                     data["watchlist"].remove(ticker)
-
                 save_data(data)
 
-                # send_single_stock_update includes the confirmation in one message
-                send_single_stock_update(ticker, confirmed=True, alert_below=alert_below)
+                send_stock_added_message(ticker, qty, buy_price, alert_below)
 
             except Exception as e:
                 print(f"[/add Error] {e}")
-                send_message("Invalid format. Example: /add RELIANCE.NS 10 2500 2400")
+                send_message("Invalid format. Example: /add TATSILV.NS 10 23.47 20")
 
-        # /remove TICKER
+        # ── /remove ────────────────────────────
         elif cmd == "/remove":
             if len(parts) < 2:
-                send_message("Usage: /remove TICKER\nExample: /remove RELIANCE.NS")
+                send_message("Usage: /remove TICKER\nExample: /remove TATSILV.NS")
                 continue
-
             ticker = parts[1].upper()
             data = load_data()
             removed = False
-
             if ticker in data["holdings"]:
                 del data["holdings"][ticker]
                 removed = True
             if ticker in data["watchlist"]:
                 data["watchlist"].remove(ticker)
                 removed = True
-
             save_data(data)
             display = ticker.replace(".NS", "").replace(".BO", "")
-
             if removed:
                 send_message(f"Removed <b>{display}</b> successfully.")
             else:
                 send_message(
-                    f"<b>{display}</b> not found in your list.\n"
-                    f"Make sure you include .NS or .BO\n"
-                    f"Example: /remove RELIANCE.NS"
+                    f"<b>{display}</b> not found.\n"
+                    f"Make sure to include .NS or .BO\n"
+                    f"Example: /remove TATSILV.NS"
                 )
 
-        # /watch TICKER
+        # ── /watch ─────────────────────────────
         elif cmd == "/watch":
             if len(parts) < 2:
                 send_message("Usage: /watch TICKER\nExample: /watch TCS.NS")
                 continue
-
             ticker = parts[1].upper()
             data = load_data()
-
             if ticker not in data["watchlist"] and ticker not in data["holdings"]:
                 data["watchlist"].append(ticker)
                 save_data(data)
-
             display = ticker.replace(".NS", "").replace(".BO", "")
-            send_message(f"Now watching <b>{display}</b> (no holding info)")
+            price = get_price(ticker)
+            now_str = datetime.now(IST).strftime("%I:%M %p")
+            if price:
+                send_message(
+                    f"Now watching <b>{display}</b>\n"
+                    f"Current Price as of {now_str} IST: Rs {price:,.2f}"
+                )
+            else:
+                send_message(
+                    f"Now watching <b>{display}</b>\n"
+                    f"Could not fetch price. Check ticker is correct."
+                )
 
-            # Send immediate price update
-            send_single_stock_update(ticker)
-
-        # /portfolio
+        # ── /portfolio ─────────────────────────
         elif cmd == "/portfolio":
-            send_hourly_update(force=True, title="Portfolio Snapshot")
+            send_portfolio(force=True, title="Portfolio Snapshot")
 
         else:
             send_message("Unknown command. Type /help to see available commands.")
-
-# Persist last update ID across calls
-# On startup, skip all existing updates so old messages aren't reprocessed
-def init_update_id():
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-    try:
-        resp = requests.get(url, params={"timeout": 5}, timeout=10)
-        results = resp.json().get("result", [])
-        if results:
-            return results[-1]["update_id"] + 1
-    except:
-        pass
-    return 0
-
-handle_commands.last_update_id = 0  # will be set properly in main()
 
 # ─────────────────────────────────────────────
 # SCHEDULER
 # ─────────────────────────────────────────────
 def setup_schedule():
-    # Send update every hour on the hour (10 AM to 4 PM)
+    # Hourly updates from 10 AM to 4 PM
     for hour in range(10, 17):
         t = f"{hour:02d}:00"
-        schedule.every().day.at(t).do(send_hourly_update)
+        schedule.every().day.at(t).do(send_portfolio)
 
-    # Market open notification at 9:15 AM
+    # 9:15 AM market open notification
     schedule.every().day.at("09:15").do(
         lambda: send_message("<b>Tracking Started!</b> Updates every hour until 5:00 PM IST.")
     )
 
-    # Final 5 PM update — forced so it always fires at market close boundary
-    schedule.every().day.at("17:00").do(
-        lambda: (send_hourly_update(force=True),
-                 send_message("<b>Tracking Stopped.</b> Will resume tomorrow at 9:15 AM IST."))
-    )
+    # 5 PM end of day update + stop notification
+    schedule.every().day.at("17:00").do(send_market_close)
 
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 def main():
+    global last_update_id
+
     if not BOT_TOKEN or not CHAT_ID:
-        print("[ERROR] BOT_TOKEN or CHAT_ID is missing. Check your .env file.")
+        print("[ERROR] BOT_TOKEN or CHAT_ID is missing.")
         return
 
-    print("Stock Bot started. Waiting for commands and market hours...")
+    print("Stock Bot started.")
 
-    # Skip all old pending messages so they don't get reprocessed
-    handle_commands.last_update_id = init_update_id()
-    print(f"Starting from update ID: {handle_commands.last_update_id}")
+    # Skip all old pending Telegram messages on startup
+    last_update_id = skip_old_updates()
 
-    # Only send the startup message on the very first run (no data file yet)
-    # This prevents spamming "Bot is Online" every time Render restarts
+    # Only send startup message on very first run (no data file exists yet)
     first_run = not os.path.exists(DATA_FILE)
     if first_run:
         send_message(
@@ -372,7 +352,6 @@ def main():
             "Hourly price + P&L reports\n\n"
             "Type /help to get started."
         )
-        # Create the data file so next restart won't send this again
         save_data({"holdings": {}, "watchlist": []})
 
     setup_schedule()
@@ -380,7 +359,7 @@ def main():
     while True:
         schedule.run_pending()
         handle_commands()
-        time.sleep(3)  # Poll for commands every 3 seconds
+        time.sleep(3)
 
 if __name__ == "__main__":
     main()
