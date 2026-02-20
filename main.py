@@ -14,8 +14,10 @@ import json
 import os
 import schedule
 from datetime import datetime
+from dotenv import load_dotenv
 import pytz
 
+load_dotenv()  # loads from .env file when running locally
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
@@ -98,7 +100,7 @@ def is_market_open():
 # ─────────────────────────────────────────────
 # HOURLY UPDATE MESSAGE
 # ─────────────────────────────────────────────
-def send_hourly_update(force=False):
+def send_hourly_update(force=False, title="Hourly Update"):
     """Send price + P&L update for all holdings and watchlist stocks."""
     if not force and not is_market_open():
         return
@@ -109,7 +111,7 @@ def send_hourly_update(force=False):
         return
 
     now_str = datetime.now(IST).strftime("%I:%M %p")
-    msg = f"<b>Hourly Update - {now_str} IST</b>\n{'─'*28}\n"
+    msg = f"<b>{title} - {now_str} IST</b>\n{'─'*28}\n"
 
     all_tickers = set(data["holdings"].keys()) | set(data["watchlist"])
 
@@ -143,8 +145,8 @@ def send_hourly_update(force=False):
 
     send_message(msg)
 
-def send_single_stock_update(ticker):
-    """Send an immediate price update for one stock right after it is added."""
+def send_single_stock_update(ticker, confirmed=False, alert_below=None):
+    """Send an immediate price update for one stock. If confirmed=True, include the add confirmation in the same message."""
     price = get_price(ticker)
     display = ticker.replace(".NS", "").replace(".BO", "")
     now_str = datetime.now(IST).strftime("%I:%M %p")
@@ -156,10 +158,18 @@ def send_single_stock_update(ticker):
         )
         return
 
-    msg = f"<b>{display}</b> - Current Price as of {now_str} IST\n"
+    data = load_data()
+    msg = ""
+
+    # If called right after /add, include the confirmation at the top
+    if confirmed and ticker in data["holdings"]:
+        h = data["holdings"][ticker]
+        alert_txt = f"\nAlert set below Rs {alert_below:,.2f}" if alert_below else ""
+        msg += f"Added <b>{display}</b>\n{h['qty']} shares @ Rs {h['buy_price']:,.2f}{alert_txt}\n\n"
+
+    msg += f"<b>{display}</b> - Current Price as of {now_str} IST\n"
     msg += f"Price: Rs {price:,.2f}\n"
 
-    data = load_data()
     if ticker in data["holdings"]:
         h = data["holdings"][ticker]
         qty = h["qty"]
@@ -243,12 +253,8 @@ def handle_commands():
 
                 save_data(data)
 
-                display = ticker.replace(".NS", "").replace(".BO", "")
-                alert_txt = f"\nAlert set below Rs {alert_below:,.2f}" if alert_below else ""
-                send_message(f"Added <b>{display}</b>\n{qty} shares @ Rs {buy_price:,.2f}{alert_txt}")
-
-                # Send immediate price update
-                send_single_stock_update(ticker)
+                # send_single_stock_update includes the confirmation in one message
+                send_single_stock_update(ticker, confirmed=True, alert_below=alert_below)
 
             except Exception as e:
                 print(f"[/add Error] {e}")
@@ -304,7 +310,7 @@ def handle_commands():
 
         # /portfolio
         elif cmd == "/portfolio":
-            send_hourly_update(force=True)
+            send_hourly_update(force=True, title="Portfolio Snapshot")
 
         else:
             send_message("Unknown command. Type /help to see available commands.")
