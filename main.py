@@ -106,14 +106,14 @@ def send_hourly_update(force=False, title="Hourly Update"):
         return
 
     data = load_data()
-    if not data["holdings"] and not data["watchlist"]:
+    all_tickers = set(data["holdings"].keys()) | set(data["watchlist"])
+
+    if not all_tickers:
         send_message("No stocks in your watchlist or holdings yet.\nUse /add to add a stock.")
         return
 
     now_str = datetime.now(IST).strftime("%I:%M %p")
     msg = f"<b>{title} - {now_str} IST</b>\n{'─'*28}\n"
-
-    all_tickers = set(data["holdings"].keys()) | set(data["watchlist"])
 
     for ticker in sorted(all_tickers):
         price = get_price(ticker)
@@ -316,7 +316,19 @@ def handle_commands():
             send_message("Unknown command. Type /help to see available commands.")
 
 # Persist last update ID across calls
-handle_commands.last_update_id = 0
+# On startup, skip all existing updates so old messages aren't reprocessed
+def init_update_id():
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    try:
+        resp = requests.get(url, params={"timeout": 5}, timeout=10)
+        results = resp.json().get("result", [])
+        if results:
+            return results[-1]["update_id"] + 1
+    except:
+        pass
+    return 0
+
+handle_commands.last_update_id = 0  # will be set properly in main()
 
 # ─────────────────────────────────────────────
 # SCHEDULER
@@ -347,12 +359,23 @@ def main():
         return
 
     print("Stock Bot started. Waiting for commands and market hours...")
-    send_message(
-        "<b>Stock Alert Bot is Online!</b>\n\n"
-        "Updates run: Mon-Fri, 9:15 AM - 5:00 PM IST\n"
-        "Hourly price + P&L reports\n\n"
-        "Type /help to get started."
-    )
+
+    # Skip all old pending messages so they don't get reprocessed
+    handle_commands.last_update_id = init_update_id()
+    print(f"Starting from update ID: {handle_commands.last_update_id}")
+
+    # Only send the startup message on the very first run (no data file yet)
+    # This prevents spamming "Bot is Online" every time Render restarts
+    first_run = not os.path.exists(DATA_FILE)
+    if first_run:
+        send_message(
+            "<b>Stock Alert Bot is Online!</b>\n\n"
+            "Updates run: Mon-Fri, 9:15 AM - 5:00 PM IST\n"
+            "Hourly price + P&L reports\n\n"
+            "Type /help to get started."
+        )
+        # Create the data file so next restart won't send this again
+        save_data({"holdings": {}, "watchlist": []})
 
     setup_schedule()
 
