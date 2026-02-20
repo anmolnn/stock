@@ -2,4 +2,5 @@ yfinance
 requests
 schedule
 pytz
-python-dotenv
+flask
+gunicorn
