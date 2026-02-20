@@ -14,10 +14,8 @@ import json
 import os
 import schedule
 from datetime import datetime
-from dotenv import load_dotenv
 import pytz
 
-load_dotenv()  # loads from .env file when running locally
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
