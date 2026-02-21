@@ -3,8 +3,7 @@ NSE/BSE Stock Alert Telegram Bot
 - Runs between 9:15 AM - 5:00 PM IST
 - Sends hourly updates: current price + gain/loss in Rs
 - Sends an immediate price update when a stock is added
-- Lets you add your Groww holdings via Telegram commands
-- Sends alert if stock falls below your set threshold
+- Flask web server for Render port binding
 """
 
 import yfinance as yf
@@ -14,7 +13,9 @@ import json
 import os
 import schedule
 from datetime import datetime
+from threading import Thread
 import pytz
+from flask import Flask
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
@@ -23,6 +24,19 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 DATA_FILE = "stock_data.json"
 IST = pytz.timezone("Asia/Kolkata")
+
+# ─────────────────────────────────────────────
+# FLASK - RENDER PORT BINDING
+# ─────────────────────────────────────────────
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Stock Bot is running!"
+
+def start_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
 # ─────────────────────────────────────────────
 # DATA PERSISTENCE
@@ -64,7 +78,7 @@ def get_updates(offset):
         return []
 
 def skip_old_updates():
-    """On startup, fast-forward past all pending messages so they are not reprocessed."""
+    """On startup, skip all pending messages so they are not reprocessed."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
     try:
         resp = requests.get(url, params={"timeout": 0}, timeout=10)
@@ -81,16 +95,15 @@ def skip_old_updates():
 # STOCK PRICE FUNCTIONS
 # ─────────────────────────────────────────────
 def get_price(ticker):
-    """Fetch current price. Tries fast_info first, falls back to history for ETFs."""
+    """Tries fast_info first, falls back to history for ETFs like TATSILV.NS."""
     try:
         stock = yf.Ticker(ticker)
         try:
             price = stock.fast_info["last_price"]
             if price and price > 0:
-                return round(price, 2)
+                return round(float(price), 2)
         except:
             pass
-        # Fallback for ETFs like TATSILV.NS
         hist = stock.history(period="2d")
         if not hist.empty:
             return round(float(hist["Close"].iloc[-1]), 2)
@@ -111,7 +124,7 @@ def format_qty(qty):
     return int(qty) if qty == int(qty) else qty
 
 # ─────────────────────────────────────────────
-# UPDATE MESSAGES
+# PORTFOLIO MESSAGE
 # ─────────────────────────────────────────────
 def send_portfolio(force=False, title="Hourly Update"):
     if not force and not is_market_open():
@@ -156,12 +169,12 @@ def send_portfolio(force=False, title="Hourly Update"):
     send_message(msg)
 
 def send_market_close():
-    """Called at 5 PM - sends final portfolio then goodbye message."""
+    """5 PM - send final update then stop notification."""
     send_portfolio(force=True, title="End of Day Update")
     send_message("<b>Tracking Stopped.</b> Resumes tomorrow at 9:15 AM IST.")
 
 def send_stock_added_message(ticker, qty, buy_price, alert_below):
-    """Single combined message shown right after /add."""
+    """Single combined message after /add - no duplicate."""
     price = get_price(ticker)
     display = ticker.replace(".NS", "").replace(".BO", "")
     now_str = datetime.now(IST).strftime("%I:%M %p")
@@ -195,17 +208,10 @@ def handle_commands():
         text = msg.get("text", "").strip()
         chat_id = str(msg.get("chat", {}).get("id", ""))
 
-        # Only respond to your own chat
-        if chat_id != str(CHAT_ID):
-            continue
-
-        # Skip empty messages
-        if not text:
+        if chat_id != str(CHAT_ID) or not text:
             continue
 
         parts = text.split()
-
-        # Skip if no command
         if not parts or not parts[0].startswith("/"):
             continue
 
@@ -315,7 +321,7 @@ def handle_commands():
 # SCHEDULER
 # ─────────────────────────────────────────────
 def setup_schedule():
-    # Hourly updates from 10 AM to 4 PM
+    # Hourly updates 10 AM to 4 PM
     for hour in range(10, 17):
         t = f"{hour:02d}:00"
         schedule.every().day.at(t).do(send_portfolio)
@@ -325,7 +331,7 @@ def setup_schedule():
         lambda: send_message("<b>Tracking Started!</b> Updates every hour until 5:00 PM IST.")
     )
 
-    # 5 PM end of day update + stop notification
+    # 5 PM end of day
     schedule.every().day.at("17:00").do(send_market_close)
 
 # ─────────────────────────────────────────────
@@ -340,10 +346,14 @@ def main():
 
     print("Stock Bot started.")
 
-    # Skip all old pending Telegram messages on startup
+    # Start Flask in background thread for Render port binding
+    web_thread = Thread(target=start_web, daemon=True)
+    web_thread.start()
+
+    # Skip all old pending messages on startup
     last_update_id = skip_old_updates()
 
-    # Only send startup message on very first run (no data file exists yet)
+    # Only send startup message on very first run
     first_run = not os.path.exists(DATA_FILE)
     if first_run:
         send_message(
