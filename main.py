@@ -316,23 +316,84 @@ def handle_commands():
 
         else:
             send_message("Unknown command. Type /help to see available commands.")
-
 # ─────────────────────────────────────────────
-# SCHEDULER
+# DAILY P&L SUMMARY
 # ─────────────────────────────────────────────
-def setup_schedule():
-    # Hourly updates 10 AM to 4 PM
-    for hour in range(10, 17):
-        t = f"{hour:02d}:00"
-        schedule.every().day.at(t).do(send_portfolio)
+def send_daily_summary():
+    data = load_data()
 
-    # 9:15 AM market open notification
-    schedule.every().day.at("09:15").do(
-        lambda: send_message("<b>Tracking Started!</b> Updates every hour until 5:00 PM IST.")
+    total_invested = 0
+    total_current = 0
+
+    for ticker, h in data["holdings"].items():
+        price = get_price(ticker)
+        if price:
+            invested = h["buy_price"] * h["qty"]
+            current = price * h["qty"]
+
+            total_invested += invested
+            total_current += current
+
+    if total_invested == 0:
+        send_message("<b>Daily Summary</b>\nNo holdings to calculate P&L.")
+        return
+
+    total_pnl = total_current - total_invested
+    percent = (total_pnl / total_invested) * 100
+
+    label = "GAIN 📈" if total_pnl >= 0 else "LOSS 📉"
+
+    send_message(
+        f"<b>Daily Summary (Market Close)</b>\n"
+        f"{'─'*28}\n"
+        f"Invested: Rs {total_invested:,.2f}\n"
+        f"Current Value: Rs {total_current:,.2f}\n"
+        f"Total P&L: Rs {total_pnl:+,.2f} ({percent:+.2f}%) {label}"
     )
+# ─────────────────────────────────────────────
+# IST-AWARE SCHEDULER (REPLACES schedule.every().day.at)
+# ─────────────────────────────────────────────
+last_scheduler_minute = None
 
-    # 5 PM end of day
-    schedule.every().day.at("17:00").do(send_market_close)
+def ist_scheduler():
+    global last_scheduler_minute
+
+    now = datetime.now(IST)
+
+    # Prevent duplicate triggers within same minute
+    if last_scheduler_minute == now.minute:
+        return
+    last_scheduler_minute = now.minute
+
+    # Market open message
+    if now.hour == 9 and now.minute == 15:
+        send_message("<b>Tracking Started!</b> Updates every hour until 5:00 PM IST.")
+
+    # Hourly updates (10 AM to 4 PM)
+    if now.minute == 0 and 10 <= now.hour <= 16:
+        send_portfolio()
+
+    # 5 PM - End of day update + daily P&L
+    if now.hour == 17 and now.minute == 0:
+        send_market_close()
+        send_daily_summary()
+
+        # Daily total P&L calculation
+        data = load_data()
+        total_pnl = 0
+
+        for ticker, h in data["holdings"].items():
+            price = get_price(ticker)
+            if price:
+                total_pnl += (price - h["buy_price"]) * h["qty"]
+
+        label = "GAIN " if total_pnl >= 0 else "LOSS "
+
+        send_message(
+            f"<b>Daily Summary</b>\n"
+            f"Total P&L: Rs {total_pnl:+,.2f} ({label})"
+        )
+
 
 # ─────────────────────────────────────────────
 # MAIN
@@ -364,10 +425,10 @@ def main():
         )
         save_data({"holdings": {}, "watchlist": []})
 
-    setup_schedule()
+    
 
     while True:
-        schedule.run_pending()
+        ist_scheduler()
         handle_commands()
         time.sleep(3)
 
