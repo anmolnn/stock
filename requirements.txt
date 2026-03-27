@@ -4,4 +4,4 @@ schedule
 pytz
 flask
 gunicorn
-flash-cors
+flask-cors
