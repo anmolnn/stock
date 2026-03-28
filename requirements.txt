@@ -5,3 +5,6 @@ pytz
 flask
 gunicorn
 flask-cors
+supabase
+pyjwt
+google-auth
