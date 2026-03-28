@@ -559,6 +559,35 @@ def api_remove(ticker):
     return jsonify({"success": removed})
 
 
+@app.route("/api/watch", methods=["POST"])
+@require_auth
+def api_watch():
+    user_id = request.user_id
+    body    = request.get_json()
+    ticker  = body.get("ticker", "").upper().strip()
+    if not ticker:
+        return jsonify({"error": "ticker is required"}), 400
+    if not ticker_in_holdings(user_id, ticker):
+        add_to_watchlist(user_id, ticker)
+    display = ticker.replace(".NS", "").replace(".BO", "")
+    user    = get_user_by_id(user_id)
+    if user and user.get("telegram_user_id"):
+        price   = get_price(ticker)
+        now_str = datetime.now(IST).strftime("%I:%M %p")
+        if price:
+            send_message_to(
+                user["telegram_user_id"],
+                f"Added to Watchlist via Dashboard: <b>{display}</b>\n"
+                f"Current Price as of {now_str} IST: Rs {price:,.2f}"
+            )
+        else:
+            send_message_to(
+                user["telegram_user_id"],
+                f"Added to Watchlist via Dashboard: <b>{display}</b>"
+            )
+    return jsonify({"success": True, "ticker": ticker})
+
+
 @app.route("/api/price/<ticker>")
 def api_price(ticker):
     price = get_price(ticker.upper())
