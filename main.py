@@ -214,16 +214,24 @@ def build_portfolio_message(user_id: int, title: str) -> str:
                     )
     return msg
 
-def send_portfolio_to_all(force=False, title="Hourly Update"):
+def send_portfolio_to_all(force=False, title="Hourly Update", eod=False):
     if not force and not is_market_open():
         return
     for user in get_all_linked_users():
+        holdings  = get_holdings(user["id"])
+        watchlist = get_watchlist(user["id"])
+        # Skip hourly updates if user has nothing — only send at market open/close
+        if not holdings and not watchlist and not eod:
+            continue
         msg = build_portfolio_message(user["id"], title)
         send_message_to(user["telegram_user_id"], msg)
 
 def send_daily_summary_to_all():
     for user in get_all_linked_users():
         holdings       = get_holdings(user["id"])
+        # Skip summary entirely if user has no holdings at all
+        if not holdings:
+            continue
         total_invested = 0
         total_current  = 0
 
@@ -234,8 +242,7 @@ def send_daily_summary_to_all():
                 total_current  += price * h["qty"]
 
         if total_invested == 0:
-            send_message_to(user["telegram_user_id"], "<b>Daily Summary</b>\nNo holdings to calculate P&L.")
-            continue
+            continue  # holdings exist but prices unavailable — skip silently
 
         total_pnl = total_current - total_invested
         percent   = (total_pnl / total_invested) * 100
@@ -617,16 +624,24 @@ def ist_scheduler():
 
     if now.hour == 9 and now.minute == 15:
         for user in get_all_linked_users():
-            send_message_to(
-                user["telegram_user_id"],
-                "<b>Market Open!</b> Tracking started. Updates every hour until 5:00 PM IST."
-            )
+            holdings  = get_holdings(user["id"])
+            watchlist = get_watchlist(user["id"])
+            if holdings or watchlist:
+                send_message_to(
+                    user["telegram_user_id"],
+                    "<b>Market Open!</b> Tracking started. Updates every hour until 5:00 PM IST."
+                )
+            else:
+                send_message_to(
+                    user["telegram_user_id"],
+                    "<b>Market Open!</b> You have no stocks yet.\nUse /add to start tracking. Next message at market close."
+                )
 
     if now.minute == 0 and 10 <= now.hour < 15:
         send_portfolio_to_all()
 
     if now.hour == 15 and now.minute == 0:
-        send_portfolio_to_all(force=True, title="End of Day Update")
+        send_portfolio_to_all(force=True, title="End of Day Update", eod=True)
         send_daily_summary_to_all()
         for user in get_all_linked_users():
             send_message_to(
